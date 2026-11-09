@@ -194,14 +194,59 @@ def cmd_projects(args):
 def cmd_show(args):
     job = client_from(args).json('GET', f'/api/jobs/{quote(args.job)}')
     keep = ('id', 'project_id', 'project_title', 'source_name', 'source_file', 'status', 'message', 'last_action', 'step_states', 'error',
-            'final_file', 'logo_replace_view', 'translation', 'segments')
+            'final_file', 'logo_replace_view', 'translation', 'segments', 'attention', 'style_choice')
     shown = {key: job.get(key) for key in keep if key in job}
     if 'segments' in shown:
         shown['segments'] = [{key: s.get(key) for key in ('index', 'start_s', 'end_s', 'video_file')} for s in shown['segments'] or []]
-    return {'job': shown, 'untrusted_fields': ['project_title', 'source_name', 'message', 'error']}
+    # 露脸角色：换人物图要用 source_id
+    shown['cast'] = [{key: person.get(key) for key in ('source_id', 'character_name', 'portrait_file')} for person in job.get('cast_members') or []]
+    return {'job': shown, 'untrusted_fields': ['project_title', 'source_name', 'message', 'error', 'attention', 'cast']}
+
+
+def cmd_portrait(args):
+    """换人物图：上传自己的图，或用人物库里的人物（--library），或换回历史里的图（--select）。只改输入、不花钱。"""
+    chosen = [value for value in (args.image, args.library, args.select) if value]
+    if len(chosen) != 1:
+        raise CliError('请给一张图片，或者用 --library 人物库编号、--select 历史图片路径三选一', 'usage')
+    client = client_from(args)
+    base = f'/api/jobs/{quote(args.job)}/portrait/{quote(args.source_id)}'
+    if args.library:
+        job = client.json('POST', base + '/library', json_body={'library_id': args.library})
+    elif args.select:
+        job = client.json('POST', base + '/select', json_body={'file': args.select})
+    else:
+        path = Path(args.image)
+        if not path.is_file():
+            raise CliError(f'找不到文件：{args.image}', 'usage')
+        with path.open('rb') as handle:
+            job = client.json('POST', base, files={'file': (path.name, handle)}, timeout=300)
+    person = next((p for p in job.get('cast_members') or [] if p.get('source_id') == args.source_id), {})
+    return {'job': args.job, 'source_id': args.source_id, 'portrait_file': person.get('portrait_file'), 'status': job.get('status'),
+            'message': job.get('message'), 'untrusted_fields': ['message']}
+
+
+def cmd_styles(args):
+    """可选的画风：id 给 replica style 用；own 表示自己写一句画风（--prompt）。"""
+    saved = (client_from(args).json('GET', '/api/settings').get('art_styles') or {})
+    rows = [{'id': row.get('id'), 'name': row.get('name'), 'prompt': row.get('prompt')} for row in saved.get('styles') or []]
+    return {'default': saved.get('default'), 'styles': rows + [{'id': 'own', 'name': '自己写（配合 --prompt）', 'prompt': None}],
+            'untrusted_fields': ['styles']}
+
+
+def cmd_style(args):
+    """改人物组的画风；已有人物图和视频保留在历史里，按新画风重新生成时才花钱。"""
+    if args.style == 'own' and not (args.prompt or '').strip():
+        raise CliError('自己写画风请用 --prompt 给出描述，例如 --prompt "和人物图画风完全一致"', 'usage')
+    body = {'id': args.style, 'prompt': args.prompt or '', **({'project': True} if args.project else {})}
+    job = client_from(args).json('PUT', f'/api/jobs/{quote(args.job)}/style', json_body=body)
+    return {'job': args.job, 'style_choice': job.get('style_choice'), 'message': job.get('message'), 'untrusted_fields': ['message']}
 
 
 def cmd_upload(args):
+    if args.analyze and args.no_analyze:
+        raise CliError('--analyze 和 --no-analyze 不能同时用', 'usage')
+    if args.analyze and not args.yes:
+        raise CliError('上传后自动分析会调用付费服务；确认要分析请加 --yes（只上传不用加 --analyze）', 'confirm', {'files': args.files})
     client = client_from(args)
     results = []
     for name in args.files:
@@ -209,11 +254,13 @@ def cmd_upload(args):
         if not path.is_file():
             raise CliError(f'找不到文件：{name}', 'usage')
         upload_id = secrets.token_hex(16)   # 同一个上传标识重试不会重复创建任务
-        form = {'variants': str(args.groups), 'character': '', 'auto_analyze': 'false' if args.no_analyze else 'true'}
+        analyze = bool(args.analyze)
+        form = {'variants': str(args.groups), 'character': '', 'auto_analyze': 'true' if analyze else 'false'}
+        headers = {'X-Replica-Upload-Id': upload_id, **({'X-Replica-Confirm': 'paid'} if analyze else {})}
         for attempt in range(3):
             try:
                 with path.open('rb') as handle:
-                    created = client.json('POST', '/api/jobs', headers={'X-Replica-Upload-Id': upload_id},
+                    created = client.json('POST', '/api/jobs', headers=headers,
                                           files={'files': (path.name, handle)}, data=form, timeout=600)
                 break
             except CliError as error:
@@ -337,8 +384,24 @@ def build_parser():
     p = sub.add_parser('upload', help='上传原视频（需要「上传」权限）')
     p.add_argument('files', nargs='+')
     p.add_argument('--groups', type=int, default=1, choices=range(1, 11), metavar='1-10')
-    p.add_argument('--no-analyze', action='store_true', help='上传后不自动分析')
+    p.add_argument('--analyze', action='store_true', help='上传后自动做剧情分析（付费，要加 --yes）')
+    p.add_argument('--no-analyze', action='store_true', help='（默认就是只上传、不分析，保留这个参数只为兼容旧写法）')
+    p.add_argument('--yes', action='store_true', help='确认自动分析会花钱')
     p.set_defaults(func=cmd_upload)
+    p = sub.add_parser('portrait', help='换某个角色的人物图：上传自己的图，或用人物库、历史里的图（需要「上传」权限，不花钱）')
+    p.add_argument('job')
+    p.add_argument('source_id', help='角色编号，见 show 里的 cast[].source_id，例如 C1')
+    p.add_argument('image', nargs='?', help='图片文件（短边至少 320 像素，最大 30 MB）')
+    p.add_argument('--library', help='用人物库里的人物（人物库编号）')
+    p.add_argument('--select', help='换回这个角色历史里的一张图（人物组里的路径）')
+    p.set_defaults(func=cmd_portrait)
+    sub.add_parser('styles', help='列出可选画风').set_defaults(func=cmd_styles)
+    p = sub.add_parser('style', help='改人物组的画风（需要「上传」权限，不花钱；已有结果保留在历史里）')
+    p.add_argument('job')
+    p.add_argument('style', help='画风 id，见 styles；own 表示自己写')
+    p.add_argument('--prompt', help='style 为 own 时的画风描述')
+    p.add_argument('--project', action='store_true', help='整个项目的人物组都用这个画风')
+    p.set_defaults(func=cmd_style)
     p = sub.add_parser('run', help='对人物组跑一步（付费步骤需要「跑付费步骤」权限和 --yes）')
     p.add_argument('job')
     p.add_argument('action', choices=PAID)
